@@ -6,10 +6,12 @@ on:
     branches:
       - main
       - release-*
+      - backplane-*
   pull_request:
     branches:
       - main
       - release-*
+      - backplane-*
 
 env:
   # Common versions
