@@ -103,7 +103,7 @@ func TestManifestOrphan(t *testing.T) {
 		validate         func(t *testing.T, manifests []runtime.Object)
 	}{
 		{
-			name:             "install namespace is open-cluster-management-agent-addon",
+			name:             "orphan the install namespace and not overwrite the pull secret",
 			getValuesFunc:    []addonfactory.GetValuesFunc{GetDefaultValues(imageName, newTestImagePullSecret())},
 			installNamespace: "open-cluster-management-agent-addon",
 			validate: func(t *testing.T, manifests []runtime.Object) {
@@ -133,7 +133,7 @@ func TestManifestOrphan(t *testing.T) {
 			},
 		},
 		{
-			name:             "install namespace is not open-cluster-management-agent-addon",
+			name:             "orphan the install namespace and not overwrite the pull secret",
 			getValuesFunc:    []addonfactory.GetValuesFunc{GetDefaultValues(imageName, newTestImagePullSecret())},
 			installNamespace: "test",
 			validate: func(t *testing.T, manifests []runtime.Object) {
@@ -145,7 +145,8 @@ func TestManifestOrphan(t *testing.T) {
 
 					namespace, nok := obj.(*corev1.Namespace)
 					if nok {
-						assert.Nil(t, namespace.Annotations, "invalid namespace annotations")
+						assert.Equal(t, map[string]string{"addon.open-cluster-management.io/deletion-orphan": ""},
+							namespace.Annotations, "invalid namespace annotations")
 						nsFound = true
 						continue
 					}
