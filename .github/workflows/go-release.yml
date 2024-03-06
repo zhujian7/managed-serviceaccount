@@ -64,12 +64,15 @@ jobs:
           CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
 
       - name: update chart version file
+        id: update_chart_version
         # if: steps.check_pull_request.outputs.pr_exists != 'true'
         run: |
           echo "Updating chart version file from $CURRENT_VERSION to $NEXT_VERSION"
           sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" ${{ env.CHART_VERSION_FILE_PATH }}
           git diff
-          cat ${{ env.CHART_VERSION_FILE_PATH }}
+          FILE_CHANGED=$(git diff --exit-code && echo false || echo true)
+          echo "file_changed=$FILE_CHANGED" >> $GITHUB_OUTPUT
+          echo "Chart version file changed: $FILE_CHANGED"
         env:
           CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
           NEXT_VERSION: ${{ steps.calculate_next_version.outputs.next_version }}
@@ -89,7 +92,7 @@ jobs:
 
 
       - name: create pull request
-        if: steps.check_pull_request.outputs.pr_exists != 'true'
+        if: steps.check_pull_request.outputs.pr_exists != 'true' && steps.update_chart_version.outputs.file_changed == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
