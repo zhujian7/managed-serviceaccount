@@ -78,13 +78,8 @@ jobs:
           gh pr list --state open > pr_list.txt
           cat pr_list.txt
           PR_EXIST=$(grep "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}" pr_list.txt && echo true || echo false)
-          echo "pr_exists=$PR_EXIST"
-          if [ "$PR_EXIST" = true ]; then
-            echo "Pull request already exists for version ${{ steps.calculate_next_version.outputs.next_version }}. Exiting."
-            echo "pr_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "No existing pull request found for version ${{ steps.calculate_next_version.outputs.next_version }}. Proceeding with creating a new one."
-          fi
+          echo "pr_exists=$PR_EXIST" >> $GITHUB_OUTPUT
+          echo "Pull request for version ${{ steps.calculate_next_version.outputs.next_version }} exists: $PR_EXIST"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -92,7 +87,7 @@ jobs:
 
       - name: create pull request
         if: steps.check_pull_request.outputs.pr_exists != 'true'
-        uses: peter-evans/create-pull-request@v3
+        uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: |
@@ -102,6 +97,7 @@ jobs:
           title: "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}"
           body: "Automatically updating version to ${{ steps.calculate_next_version.outputs.next_version }}"
           branch: update-chart-version-${{ steps.calculate_next_version.outputs.next_version }}
+          signoff: true
         env:
           CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
           NEXT_VERSION: ${{ steps.calculate_next_version.outputs.next_version }}
