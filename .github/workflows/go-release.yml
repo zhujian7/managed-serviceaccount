@@ -66,6 +66,7 @@ jobs:
       - name: update chart version file
         id: update_chart_version
         run: |
+          echo "gh actor: $GITHUB_ACTOR"
           echo "Updating chart version file from $CURRENT_VERSION to $NEXT_VERSION"
           sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" ${{ env.CHART_VERSION_FILE_PATH }}
           git diff
