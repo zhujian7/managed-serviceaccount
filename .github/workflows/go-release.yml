@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           path: go/src/open-cluster-management.io/managed-serviceaccount
@@ -43,7 +43,7 @@ jobs:
     needs: [ env ]
     steps:
       - name: checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           path: go/src/open-cluster-management.io/managed-serviceaccount
@@ -51,7 +51,7 @@ jobs:
       - name: calculate next version
         id: calculate_next_version
         run: |
-          CURRENT_VERSION = "${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}"
+          CURRENT_VERSION=${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
           echo "Current version: $CURRENT_VERSION"
           # Extract the major and minor version components
           MAJOR=$(echo $CURRENT_VERSION | cut -d '.' -f 1)
