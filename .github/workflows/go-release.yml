@@ -68,6 +68,7 @@ jobs:
         run: |
           echo "Updating chart version file from $CURRENT_VERSION to $NEXT_VERSION"
           sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" ${{ env.CHART_VERSION_FILE_PATH }}
+          cat ${{ env.CHART_VERSION_FILE_PATH }}
         env:
           CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
           NEXT_VERSION: ${{ steps.calculate_next_version.outputs.next_version }}
