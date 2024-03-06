@@ -98,6 +98,7 @@ jobs:
           body: "Automatically updating version to ${{ steps.calculate_next_version.outputs.next_version }}"
           branch: update-chart-version-${{ steps.calculate_next_version.outputs.next_version }}
           signoff: true
+          base: main
         env:
           CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
           NEXT_VERSION: ${{ steps.calculate_next_version.outputs.next_version }}
