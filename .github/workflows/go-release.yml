@@ -75,9 +75,11 @@ jobs:
       - name: check if pull request already exists
         id: check_pull_request
         run: |
-          gh pr list --state open --base "update-chart-version-${{ steps.calculate_next_version.outputs.next_version }}" > pr_list.txt
+          gh pr list --state open > pr_list.txt
           cat pr_list.txt
+          echo "debug try to grep"
           PR_EXIST=$(grep "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}" pr_list.txt)
+          echo "debug end of grep"
           echo "pr_exist=$PR_EXIST"
           if [ -n "$PR_EXIST" ]; then
             echo "Pull request already exists for version ${{ steps.calculate_next_version.outputs.next_version }}. Exiting."
