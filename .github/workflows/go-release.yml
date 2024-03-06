@@ -11,7 +11,7 @@ env:
   GOPATH: '/home/runner/work/managed-serviceaccount/managed-serviceaccount/go'
   GITHUB_REF: ${{ github.ref }}
   CHART_NAME: managed-serviceaccount
-  CHART_VERSION_FILE_PATH: ../charts/managed-serviceaccount/Chart.yaml
+  CHART_VERSION_FILE_PATH: ./charts/managed-serviceaccount/Chart.yaml
 
 defaults:
   run:
@@ -51,7 +51,6 @@ jobs:
       - name: calculate next version
         id: calculate_next_version
         run: |
-          CURRENT_VERSION=${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
           echo "Current version: $CURRENT_VERSION"
           # Extract the major and minor version components
           MAJOR=$(echo $CURRENT_VERSION | cut -d '.' -f 1)
@@ -61,12 +60,17 @@ jobs:
           # Construct the next version
           NEXT_VERSION="$MAJOR.$NEXT_MINOR.0"
           echo "next_version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+        env:
+          CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
 
       - name: update chart version file
         # if: steps.check_pull_request.outputs.pr_exists != 'true'
         run: |
-          # NEXT_VERSION=$INPUT_NEXT_VERSION
-          sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" VERSION_FILE_PATH
+          echo "Updating chart version file from $CURRENT_VERSION to $NEXT_VERSION"
+          sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" ${{ env.CHART_VERSION_FILE_PATH }}
+        env:
+          CURRENT_VERSION: ${{ needs.env.outputs.TRIMMED_RELEASE_VERSION }}
+          NEXT_VERSION: ${{ steps.calculate_next_version.outputs.next_version }}
 
       - name: check if pull request already exists
         id: check_pull_request
