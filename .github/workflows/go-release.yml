@@ -78,6 +78,7 @@ jobs:
           gh pr list --state open > pr_list.txt
           cat pr_list.txt
           echo "debug try to grep"
+          echo "grep Update chart version to ${{ steps.calculate_next_version.outputs.next_version }} pr_list.txt"
           PR_EXIST=$(grep "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}" pr_list.txt)
           echo "debug end of grep"
           echo "pr_exist=$PR_EXIST"
