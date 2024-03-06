@@ -94,7 +94,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: |
             Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}
-          title: "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}"
+          title: ":seedling: Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}"
           body: "Automatically updating version to ${{ steps.calculate_next_version.outputs.next_version }}"
           branch: update-chart-version-${{ steps.calculate_next_version.outputs.next_version }}
           signoff: true
