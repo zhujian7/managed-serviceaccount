@@ -1,0 +1,1 @@
+1	Red Hat Konflux update managed-serviceaccount	appstudio-managed-serviceaccount	OPEN	2024-03-04T03:12:34Z
