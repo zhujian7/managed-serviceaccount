@@ -60,7 +60,13 @@ jobs:
           NEXT_MINOR=$((MINOR + 1))
           # Construct the next version
           NEXT_VERSION="$MAJOR.$NEXT_MINOR.0"
-          echo "::set-output name=next_version::$NEXT_VERSION"
+          echo "next_version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: update chart version file
+        # if: steps.check_pull_request.outputs.pr_exists != 'true'
+        run: |
+          # NEXT_VERSION=$INPUT_NEXT_VERSION
+          sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" VERSION_FILE_PATH
 
       - name: check if pull request already exists
         id: check_pull_request
@@ -68,15 +74,14 @@ jobs:
           PR_EXIST=$(gh pr list --state open --base "update-chart-version-${{ steps.calculate_next_version.outputs.next_version }}" | grep "Update version to ${{ steps.calculate_next_version.outputs.next_version }}")
           if [ -n "$PR_EXIST" ]; then
             echo "Pull request already exists for version ${{ steps.calculate_next_version.outputs.next_version }}. Exiting."
-            echo "::set-output name=pr_exists::true"
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
           else
             echo "No existing pull request found for version ${{ steps.calculate_next_version.outputs.next_version }}. Proceeding with creating a new one."
           fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: update chart version file
-        run: |
-          # NEXT_VERSION=$INPUT_NEXT_VERSION
-          sed -i "s/version: $CURRENT_VERSION/version: $NEXT_VERSION/" VERSION_FILE_PATH
+
 
       - name: create pull request
         if: steps.check_pull_request.outputs.pr_exists != 'true'
