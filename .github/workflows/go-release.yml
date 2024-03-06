@@ -77,10 +77,9 @@ jobs:
         run: |
           gh pr list --state open > pr_list.txt
           cat pr_list.txt
-          set +e
-          PR_EXIST=$(grep "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}" pr_list.txt)
-          set -e
-          if [ $? -eq 0 ]; then
+          PR_EXIST=$(grep "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}" pr_list.txt && echo true || echo false)
+          echo "pr_exists=$PR_EXIST"
+          if [ "$PR_EXIST" = true ]; then
             echo "Pull request already exists for version ${{ steps.calculate_next_version.outputs.next_version }}. Exiting."
             echo "pr_exists=true" >> $GITHUB_OUTPUT
           else
