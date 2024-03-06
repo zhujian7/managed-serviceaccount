@@ -80,6 +80,7 @@ jobs:
           PR_EXIST=$(grep "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}" pr_list.txt && echo true || echo false)
           echo "pr_exists=$PR_EXIST" >> $GITHUB_OUTPUT
           echo "Pull request for version ${{ steps.calculate_next_version.outputs.next_version }} exists: $PR_EXIST"
+          rm -rf pr_list.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -92,8 +93,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: |
             Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}
-
-            Signed-off-by: "$GITHUB_ACTOR" "$GITHUB_ACTOR@users.noreply.github.com"
           title: "Update chart version to ${{ steps.calculate_next_version.outputs.next_version }}"
           body: "Automatically updating version to ${{ steps.calculate_next_version.outputs.next_version }}"
           branch: update-chart-version-${{ steps.calculate_next_version.outputs.next_version }}
