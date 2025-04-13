@@ -92,6 +92,6 @@ require (
 	k8s.io/kube-openapi v0.0.0-20231010175941-2dd684a91f00 // indirect
 	open-cluster-management.io/sdk-go v0.13.0 // indirect
 	sigs.k8s.io/json v0.0.0-20221116044647-bc3834ca7abd // indirect
-	sigs.k8s.io/structured-merge-diff/v4 v4.4.1 // indirect
+	sigs.k8s.io/structured-merge-diff/v4 v4.7.0 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
