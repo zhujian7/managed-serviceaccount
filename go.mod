@@ -4,7 +4,7 @@ go 1.21
 
 require (
 	github.com/onsi/ginkgo/v2 v2.15.0
-	github.com/onsi/gomega v1.31.1
+	github.com/onsi/gomega v1.37.0
 	github.com/pkg/errors v0.9.1
 	github.com/stretchr/testify v1.9.0
 	k8s.io/api v0.29.2
