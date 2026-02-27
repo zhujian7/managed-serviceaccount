@@ -521,15 +521,27 @@ func isBindingBound(binding *clusterv1beta2.ManagedClusterSetBinding) bool {
 }
 ```
 
-### Component 2: cluster-proxy Enhancement
+### Component 2: cluster-proxy user-server Enhancement
 
-cluster-proxy needs to be enhanced to support transparent token acquisition.
+The cluster-proxy **user-server** component (hub-side HTTP proxy) needs to be enhanced to support transparent token acquisition.
 
-#### cluster-proxy Token Resolution Logic
+#### Architecture Note
+
+cluster-proxy has these components:
+- **Hub**: user-server (HTTP proxy) + ANP proxy-server (gRPC tunnel server)
+- **Spoke**: proxy-agent (gRPC tunnel client)
+
+The ServiceAccountMapping logic goes in **user-server.ServeHTTP()** because:
+- It already receives HTTP requests from applications
+- It can see and modify HTTP headers (including Authorization)
+- It can extract caller ServiceAccount identity from authenticated requests
+- It already creates tunnels to managed clusters
+
+#### user-server Token Resolution Logic
 
 ```go
-// pkg/proxyserver/middleware/token_resolver.go
-package middleware
+// pkg/userserver/token_resolver.go
+package userserver
 
 import (
     "context"
@@ -656,54 +668,91 @@ func (r *TokenResolver) getClusterClient(clusterName string) (kubernetes.Interfa
     return client, nil
 }
 
-// Middleware wraps the proxy handler to inject spoke tokens
-func (r *TokenResolver) Middleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-        // Extract user info from context (set by Kubernetes API server authentication)
-        userInfo, ok := request.UserFrom(req.Context())
-        if !ok {
-            http.Error(w, "no user info", http.StatusUnauthorized)
-            return
-        }
-
-        // Only handle ServiceAccount users
-        if !strings.HasPrefix(userInfo.GetName(), "system:serviceaccount:") {
-            // Not a service account, pass through
-            next.ServeHTTP(w, req)
-            return
-        }
-
-        // Parse ServiceAccount name: system:serviceaccount:<namespace>:<name>
-        parts := strings.Split(userInfo.GetName(), ":")
-        if len(parts) != 4 {
-            next.ServeHTTP(w, req)
-            return
-        }
-        namespace := parts[2]
-        saName := parts[3]
-
-        // Extract target cluster from request path
-        // Path format: /apis/cluster.open-cluster-management.io/v1beta1/managedclusters/<cluster>/proxy/...
-        targetCluster := extractClusterFromPath(req.URL.Path)
-        if targetCluster == "" {
-            next.ServeHTTP(w, req)
-            return
-        }
-
-        // Resolve token
-        token, err := r.ResolveToken(req.Context(), namespace, saName, targetCluster)
+// Enhanced ServeHTTP for user-server with ServiceAccountMapping support
+func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
+    if klog.V(4).Enabled() {
+        dump, err := httputil.DumpRequest(req, true)
         if err != nil {
-            // No mapping found, pass through (might be using other auth)
-            next.ServeHTTP(w, req)
+            http.Error(wr, err.Error(), http.StatusBadRequest)
             return
         }
+        klog.V(4).Infof("request:\n%s", string(dump))
+    }
 
-        // Inject token into request
-        req.Header.Set("Authorization", "Bearer "+token)
+    var tsc utils.TargetServiceConfig
+    var err error
 
-        // Forward request
-        next.ServeHTTP(w, req)
-    })
+    switch utils.GetProxyType(req.RequestURI) {
+    case utils.ProxyTypeService:
+        tsc, err = utils.GetTargetServiceConfig(req.RequestURI)
+    case utils.ProxyTypeKubeAPIServer:
+        tsc, err = utils.GetTargetServiceConfigForKubeAPIServer(req.RequestURI)
+    }
+    if err != nil {
+        http.Error(wr, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    // NEW: Extract caller ServiceAccount from authentication
+    callerNamespace, callerSA, err := extractServiceAccountFromAuth(req)
+    if err == nil && callerSA != "" {
+        // Try to resolve token via ServiceAccountMapping
+        if token, err := k.tokenResolver.ResolveToken(req.Context(), callerNamespace, callerSA, tsc.Cluster); err == nil {
+            // Inject spoke token
+            req.Header.Set("Authorization", "Bearer "+token)
+            klog.V(4).Infof("Injected spoke token for hub SA %s/%s -> cluster %s", callerNamespace, callerSA, tsc.Cluster)
+        } else {
+            klog.V(4).Infof("No ServiceAccountMapping found for %s/%s, using original auth", callerNamespace, callerSA)
+        }
+    }
+
+    // Continue with existing proxy logic
+    targetURL, err := url.Parse(serviceProxyURL(tsc.Cluster))
+    if err != nil {
+        http.Error(wr, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    tunnel, err := k.getTunnel(req.Context())
+    if err != nil {
+        http.Error(wr, err.Error(), http.StatusBadRequest)
+        return
+    }
+
+    proxy := httputil.NewSingleHostReverseProxy(targetURL)
+    proxy.Transport = &http.Transport{
+        DialContext:       tunnel.DialContext,
+        // ... existing config
+    }
+    proxy.ServeHTTP(wr, req)
+}
+
+// extractServiceAccountFromAuth extracts ServiceAccount namespace and name from request
+func extractServiceAccountFromAuth(req *http.Request) (namespace, name string, err error) {
+    // Check for client certificate (common in-cluster auth)
+    if req.TLS != nil && len(req.TLS.PeerCertificates) > 0 {
+        cert := req.TLS.PeerCertificates[0]
+        // Parse from cert subject: system:serviceaccount:<namespace>:<name>
+        for _, name := range cert.Subject.Names {
+            if nameStr, ok := name.Value.(string); ok {
+                if strings.HasPrefix(nameStr, "system:serviceaccount:") {
+                    parts := strings.Split(nameStr, ":")
+                    if len(parts) == 4 {
+                        return parts[2], parts[3], nil
+                    }
+                }
+            }
+        }
+    }
+
+    // Check Authorization header for existing token (less common)
+    authHeader := req.Header.Get("Authorization")
+    if strings.HasPrefix(authHeader, "Bearer ") {
+        // Could validate token to extract SA info, but complex
+        // For now, rely on certificate authentication
+    }
+
+    return "", "", fmt.Errorf("no ServiceAccount found in request")
 }
 
 func (c *TokenCache) Get(key string) string {
