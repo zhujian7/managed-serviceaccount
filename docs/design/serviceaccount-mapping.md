@@ -138,51 +138,57 @@ Introduce a **ServiceAccountMapping** CRD that maps hub ServiceAccounts to manag
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐  │
 │  │ 3. ArgoCD App (using argocd-hub-sa)                      │  │
-│  │    Makes request via cluster-proxy to cluster1           │  │
+│  │    Makes request via cluster-proxy user-server           │  │
 │  └──────────────────┬───────────────────────────────────────┘  │
 │                     │                                            │
 │                     ▼                                            │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ 4. cluster-proxy Hub Agent                               │  │
-│  │    - Detects caller: argocd-hub-sa                       │  │
-│  │    - Looks up ServiceAccountMapping in argocd namespace  │  │
-│  │    - Finds mapping: argocd-hub-sa → argocd-spoke-sa     │  │
-│  │    - Checks token cache (miss)                           │  │
+│  │ 4. cluster-proxy user-server (HTTP proxy)                │  │
+│  │    - Receives HTTP request from ArgoCD                   │  │
+│  │    - Forwards through tunnel to proxy-agent              │  │
 │  └──────────────────┬───────────────────────────────────────┘  │
 │                     │                                            │
 └─────────────────────┼────────────────────────────────────────────┘
-                      │ cluster-proxy tunnel
+                      │ cluster-proxy gRPC tunnel
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Managed Cluster (cluster1)                   │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ 5. cluster-proxy calls TokenRequest API                  │  │
-│  │    POST /api/v1/namespaces/argocd/serviceaccounts/       │  │
-│  │         argocd-spoke-sa/token                            │  │
-│  │    Body: {expirationSeconds: 3600}                       │  │
+│  │ 5. proxy-agent (spoke-side)                              │  │
+│  │    - Watches ServiceAccountMapping on hub                │  │
+│  │    - Receives request via tunnel                         │  │
+│  │    - Detects caller: argocd-hub-sa (from request auth)   │  │
+│  │    - Looks up mapping in local cache                     │  │
+│  │      argocd/argocd-hub-sa → argocd-spoke-sa             │  │
+│  │    - Checks token cache (miss)                           │  │
+│  │    - Calls LOCAL TokenRequest API                        │  │
+│  │      POST /api/v1/namespaces/argocd/serviceaccounts/     │  │
+│  │           argocd-spoke-sa/token                          │  │
+│  │    - Caches token (55 minutes)                           │  │
+│  │    - Injects token into Authorization header             │  │
+│  │    - Forwards to local API server                        │  │
 │  └──────────────────┬───────────────────────────────────────┘  │
 │                     │                                            │
 │                     ▼                                            │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ 6. Returns short-lived token (1 hour)                    │  │
+│  │ 6. Kubernetes API Server                                 │  │
+│  │    - Receives request with argocd-spoke-sa token         │  │
+│  │    - Processes request                                   │  │
+│  │    - Returns response                                    │  │
 │  └──────────────────┬───────────────────────────────────────┘  │
 │                     │                                            │
+│                     ▼                                            │
+│                  Response                                        │
+│                     │                                            │
 └─────────────────────┼────────────────────────────────────────────┘
-                      │
+                      │ back through tunnel
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Hub Cluster                             │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │ 7. cluster-proxy                                         │  │
-│  │    - Caches token for 55 minutes                         │  │
-│  │    - Forwards original request with spoke token          │  │
-│  └──────────────────┬───────────────────────────────────────┘  │
-│                     │                                            │
-│                     ▼                                            │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │ 8. ArgoCD App                                            │  │
+│  │ 7. ArgoCD App                                            │  │
 │  │    - Receives response from cluster1                     │  │
 │  │    - No token management code needed!                    │  │
 │  └──────────────────────────────────────────────────────────┘  │
@@ -194,9 +200,11 @@ Introduce a **ServiceAccountMapping** CRD that maps hub ServiceAccounts to manag
 
 1. **Transparency**: Applications don't know tokens are being managed
 2. **Automatic Provisioning**: ManagedServiceAccounts created automatically for bound clusters
-3. **Cluster-proxy Enhancement**: cluster-proxy handles token lifecycle (request, cache, refresh)
-4. **Direct Token Requests**: cluster-proxy directly calls managed cluster TokenRequest API (no aggregated API)
-5. **ManagedClusterSetBinding Integration**: Leverage existing multi-cluster grouping
+3. **Spoke-side Processing**: proxy-agent (on spoke) watches hub and handles token lifecycle
+4. **Hub Watch**: proxy-agent watches ServiceAccountMapping CRs on hub using existing hub kubeconfig
+5. **Local Token Generation**: Tokens generated locally on spoke (lower latency, less hub load)
+6. **Distributed Caching**: Each spoke caches its own tokens (better scalability)
+7. **ManagedClusterSetBinding Integration**: Leverage existing multi-cluster grouping
 
 ---
 
@@ -521,49 +529,60 @@ func isBindingBound(binding *clusterv1beta2.ManagedClusterSetBinding) bool {
 }
 ```
 
-### Component 2: cluster-proxy user-server Enhancement
+### Component 2: cluster-proxy proxy-agent Enhancement
 
-The cluster-proxy **user-server** component (hub-side HTTP proxy) needs to be enhanced to support transparent token acquisition.
+The cluster-proxy **proxy-agent** component (spoke-side) needs to be enhanced to support transparent token acquisition.
 
 #### Architecture Note
 
 cluster-proxy has these components:
+
 - **Hub**: user-server (HTTP proxy) + ANP proxy-server (gRPC tunnel server)
 - **Spoke**: proxy-agent (gRPC tunnel client)
 
-The ServiceAccountMapping logic goes in **user-server.ServeHTTP()** because:
-- It already receives HTTP requests from applications
-- It can see and modify HTTP headers (including Authorization)
-- It can extract caller ServiceAccount identity from authenticated requests
-- It already creates tunnels to managed clusters
+The ServiceAccountMapping logic goes in **proxy-agent** (spoke-side) because:
 
-#### user-server Token Resolution Logic
+- proxy-agent already has hub kubeconfig (for OCM operations)
+- proxy-agent can watch ServiceAccountMapping CRs on hub
+- Token generation happens locally on spoke (lower latency, less hub load)
+- Distributed token caching across spokes (better scalability)
+- No extra network hop from hub to spoke for token requests
+
+#### proxy-agent Hub Watch and Token Resolution Logic
 
 ```go
-// pkg/userserver/token_resolver.go
-package userserver
+// pkg/proxyagent/sa_mapping_watcher.go
+package proxyagent
 
 import (
     "context"
     "fmt"
-    "net/http"
     "sync"
     "time"
 
     authv1 "k8s.io/api/authentication/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/watch"
     "k8s.io/client-go/kubernetes"
+    "k8s.io/klog/v2"
     "sigs.k8s.io/controller-runtime/pkg/client"
 
     authv1beta1 "open-cluster-management.io/managed-serviceaccount/apis/authentication/v1beta1"
 )
 
-// TokenResolver resolves hub ServiceAccount to spoke tokens via ServiceAccountMapping
-type TokenResolver struct {
-    hubClient     client.Client
-    tokenCache    *TokenCache
-    clusterClients map[string]kubernetes.Interface // Cluster name -> client
-    mu            sync.RWMutex
+// SAMappingWatcher watches ServiceAccountMapping resources on the hub
+// and maintains a local cache of mappings for this spoke cluster
+type SAMappingWatcher struct {
+    hubClient        client.Client
+    spokeClient      kubernetes.Interface
+    clusterName      string
+
+    // mapping cache: "hubNamespace/hubSA" -> spokeSA
+    mappings         map[string]string
+    mappingsMu       sync.RWMutex
+
+    // token cache: "hubNamespace/hubSA" -> token
+    tokenCache       *TokenCache
 }
 
 // TokenCache caches spoke tokens
@@ -577,182 +596,165 @@ type CachedToken struct {
     Expiration time.Time
 }
 
-// ResolveToken resolves a hub ServiceAccount to a spoke token for the target cluster
-func (r *TokenResolver) ResolveToken(
-    ctx context.Context,
-    hubNamespace string,
-    hubServiceAccount string,
-    targetCluster string,
-) (string, error) {
-    // 1. Check cache
-    cacheKey := fmt.Sprintf("%s/%s/%s", hubNamespace, hubServiceAccount, targetCluster)
-    if token := r.tokenCache.Get(cacheKey); token != "" {
+func NewSAMappingWatcher(hubClient client.Client, spokeClient kubernetes.Interface, clusterName string) *SAMappingWatcher {
+    return &SAMappingWatcher{
+        hubClient:   hubClient,
+        spokeClient: spokeClient,
+        clusterName: clusterName,
+        mappings:    make(map[string]string),
+        tokenCache:  NewTokenCache(),
+    }
+}
+
+// Start begins watching ServiceAccountMapping resources on the hub
+func (w *SAMappingWatcher) Start(ctx context.Context) error {
+    // List all ServiceAccountMappings on hub
+    mappingList := &authv1beta1.ServiceAccountMappingList{}
+    if err := w.hubClient.List(ctx, mappingList); err != nil {
+        return fmt.Errorf("failed to list ServiceAccountMappings: %w", err)
+    }
+
+    // Build initial cache
+    for i := range mappingList.Items {
+        w.updateMapping(&mappingList.Items[i])
+    }
+
+    // Start watching for changes
+    go w.watchLoop(ctx)
+
+    klog.Infof("SAMappingWatcher started for cluster %s, loaded %d mappings",
+        w.clusterName, len(w.mappings))
+
+    return nil
+}
+
+// watchLoop watches for ServiceAccountMapping changes on hub
+func (w *SAMappingWatcher) watchLoop(ctx context.Context) {
+    // Use controller-runtime watch or informers to watch ServiceAccountMapping
+    // For simplicity, showing periodic sync here
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // Re-sync mappings periodically
+            mappingList := &authv1beta1.ServiceAccountMappingList{}
+            if err := w.hubClient.List(ctx, mappingList); err != nil {
+                klog.Errorf("Failed to list ServiceAccountMappings: %v", err)
+                continue
+            }
+
+            for i := range mappingList.Items {
+                w.updateMapping(&mappingList.Items[i])
+            }
+        }
+    }
+}
+
+// updateMapping updates the local mapping cache
+func (w *SAMappingWatcher) updateMapping(mapping *authv1beta1.ServiceAccountMapping) {
+    w.mappingsMu.Lock()
+    defer w.mappingsMu.Unlock()
+
+    key := fmt.Sprintf("%s/%s", mapping.Namespace, mapping.Spec.HubServiceAccount)
+    spokeSA := mapping.Spec.ManagedServiceAccount
+
+    w.mappings[key] = spokeSA
+    klog.V(4).Infof("Updated mapping: %s -> %s", key, spokeSA)
+}
+
+// LookupMapping finds the spoke ServiceAccount for a hub ServiceAccount
+func (w *SAMappingWatcher) LookupMapping(hubNamespace, hubSA string) (spokeSA string, found bool) {
+    w.mappingsMu.RLock()
+    defer w.mappingsMu.RUnlock()
+
+    key := fmt.Sprintf("%s/%s", hubNamespace, hubSA)
+    spokeSA, found = w.mappings[key]
+    return spokeSA, found
+}
+
+// ResolveToken generates a token for the spoke ServiceAccount
+func (w *SAMappingWatcher) ResolveToken(ctx context.Context, hubNamespace, hubSA string) (string, error) {
+    // 1. Check token cache
+    cacheKey := fmt.Sprintf("%s/%s", hubNamespace, hubSA)
+    if token := w.tokenCache.Get(cacheKey); token != "" {
         return token, nil
     }
 
-    // 2. Find ServiceAccountMapping in hub namespace
-    mappings := &authv1beta1.ServiceAccountMappingList{}
-    if err := r.hubClient.List(ctx, mappings, client.InNamespace(hubNamespace)); err != nil {
-        return "", fmt.Errorf("failed to list ServiceAccountMappings: %w", err)
+    // 2. Lookup mapping
+    spokeSA, found := w.LookupMapping(hubNamespace, hubSA)
+    if !found {
+        return "", fmt.Errorf("no ServiceAccountMapping found for %s/%s", hubNamespace, hubSA)
     }
 
-    var mapping *authv1beta1.ServiceAccountMapping
-    for i := range mappings.Items {
-        if mappings.Items[i].Spec.HubServiceAccount == hubServiceAccount {
-            mapping = &mappings.Items[i]
-            break
-        }
-    }
-
-    if mapping == nil {
-        return "", fmt.Errorf("no ServiceAccountMapping found for hub SA %s/%s",
-            hubNamespace, hubServiceAccount)
-    }
-
-    // 3. Get spoke service account name from mapping
-    spokeSAName := mapping.Spec.ManagedServiceAccount
-    spokeNamespace := hubNamespace // Spoke SA in same namespace as hub
-
-    // 4. Get cluster client
-    clusterClient, err := r.getClusterClient(targetCluster)
-    if err != nil {
-        return "", fmt.Errorf("failed to get cluster client for %s: %w", targetCluster, err)
-    }
-
-    // 5. Request token from managed cluster directly
+    // 3. Generate token locally on spoke using local TokenRequest API
     expirationSeconds := int64(3600)
-    if mapping.Spec.TokenExpirationSeconds != nil {
-        expirationSeconds = *mapping.Spec.TokenExpirationSeconds
-    }
-
     tokenRequest := &authv1.TokenRequest{
         Spec: authv1.TokenRequestSpec{
             ExpirationSeconds: &expirationSeconds,
         },
     }
 
-    result, err := clusterClient.CoreV1().
-        ServiceAccounts(spokeNamespace).
-        CreateToken(ctx, spokeSAName, tokenRequest, metav1.CreateOptions{})
+    // Call LOCAL kube-apiserver TokenRequest API
+    result, err := w.spokeClient.CoreV1().
+        ServiceAccounts(hubNamespace).
+        CreateToken(ctx, spokeSA, tokenRequest, metav1.CreateOptions{})
     if err != nil {
-        return "", fmt.Errorf("failed to create token on cluster %s: %w", targetCluster, err)
+        return "", fmt.Errorf("failed to create token for spoke SA %s/%s: %w", hubNamespace, spokeSA, err)
     }
 
-    // 6. Cache token (expire 5 minutes before actual expiration)
-    r.tokenCache.Set(cacheKey, result.Status.Token, result.Status.ExpirationTimestamp.Time)
+    // 4. Cache token
+    w.tokenCache.Set(cacheKey, result.Status.Token, result.Status.ExpirationTimestamp.Time)
+
+    klog.V(4).Infof("Generated token for hub SA %s/%s -> spoke SA %s", hubNamespace, hubSA, spokeSA)
 
     return result.Status.Token, nil
 }
 
-// getClusterClient returns a client for the target managed cluster
-func (r *TokenResolver) getClusterClient(clusterName string) (kubernetes.Interface, error) {
-    r.mu.RLock()
-    client, exists := r.clusterClients[clusterName]
-    r.mu.RUnlock()
-
-    if exists {
-        return client, nil
-    }
-
-    // Create new client via cluster-proxy mechanism
-    // This uses existing cluster-proxy infrastructure
-    client, err := r.createClusterClient(clusterName)
+// Request handler in proxy-agent that intercepts requests before forwarding to API server
+func (w *SAMappingWatcher) HandleRequest(req *http.Request) error {
+    // Extract hub ServiceAccount from request authentication
+    // In proxy-agent, the request comes through the tunnel with original authentication
+    hubNamespace, hubSA, err := extractHubSAFromRequest(req)
     if err != nil {
-        return nil, err
+        // No hub SA mapping needed, pass through
+        return nil
     }
 
-    r.mu.Lock()
-    r.clusterClients[clusterName] = client
-    r.mu.Unlock()
+    // Try to resolve spoke token
+    token, err := w.ResolveToken(req.Context(), hubNamespace, hubSA)
+    if err != nil {
+        // No mapping found or token generation failed, pass through original auth
+        klog.V(4).Infof("No token resolved for %s/%s: %v", hubNamespace, hubSA, err)
+        return nil
+    }
 
-    return client, nil
+    // Inject spoke token
+    req.Header.Set("Authorization", "Bearer "+token)
+    klog.V(4).Infof("Injected spoke token for hub SA %s/%s", hubNamespace, hubSA)
+
+    return nil
 }
 
-// Enhanced ServeHTTP for user-server with ServiceAccountMapping support
-func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
-    if klog.V(4).Enabled() {
-        dump, err := httputil.DumpRequest(req, true)
-        if err != nil {
-            http.Error(wr, err.Error(), http.StatusBadRequest)
-            return
-        }
-        klog.V(4).Infof("request:\n%s", string(dump))
-    }
+// extractHubSAFromRequest extracts hub ServiceAccount from request
+// This needs to parse the authentication info that comes through the tunnel
+func extractHubSAFromRequest(req *http.Request) (namespace, name string, err error) {
+    // The request comes through cluster-proxy tunnel with original client cert or token
+    // Need to parse ServiceAccount identity from authentication headers/certs
+    // Implementation depends on how cluster-proxy forwards auth info
 
-    var tsc utils.TargetServiceConfig
-    var err error
-
-    switch utils.GetProxyType(req.RequestURI) {
-    case utils.ProxyTypeService:
-        tsc, err = utils.GetTargetServiceConfig(req.RequestURI)
-    case utils.ProxyTypeKubeAPIServer:
-        tsc, err = utils.GetTargetServiceConfigForKubeAPIServer(req.RequestURI)
-    }
-    if err != nil {
-        http.Error(wr, err.Error(), http.StatusBadRequest)
-        return
-    }
-
-    // NEW: Extract caller ServiceAccount from authentication
-    callerNamespace, callerSA, err := extractServiceAccountFromAuth(req)
-    if err == nil && callerSA != "" {
-        // Try to resolve token via ServiceAccountMapping
-        if token, err := k.tokenResolver.ResolveToken(req.Context(), callerNamespace, callerSA, tsc.Cluster); err == nil {
-            // Inject spoke token
-            req.Header.Set("Authorization", "Bearer "+token)
-            klog.V(4).Infof("Injected spoke token for hub SA %s/%s -> cluster %s", callerNamespace, callerSA, tsc.Cluster)
-        } else {
-            klog.V(4).Infof("No ServiceAccountMapping found for %s/%s, using original auth", callerNamespace, callerSA)
-        }
-    }
-
-    // Continue with existing proxy logic
-    targetURL, err := url.Parse(serviceProxyURL(tsc.Cluster))
-    if err != nil {
-        http.Error(wr, err.Error(), http.StatusBadRequest)
-        return
-    }
-
-    tunnel, err := k.getTunnel(req.Context())
-    if err != nil {
-        http.Error(wr, err.Error(), http.StatusBadRequest)
-        return
-    }
-
-    proxy := httputil.NewSingleHostReverseProxy(targetURL)
-    proxy.Transport = &http.Transport{
-        DialContext:       tunnel.DialContext,
-        // ... existing config
-    }
-    proxy.ServeHTTP(wr, req)
+    // Placeholder - actual implementation would extract from TLS client cert
+    // or from impersonation headers if cluster-proxy supports that
+    return "", "", fmt.Errorf("not implemented")
 }
 
-// extractServiceAccountFromAuth extracts ServiceAccount namespace and name from request
-func extractServiceAccountFromAuth(req *http.Request) (namespace, name string, err error) {
-    // Check for client certificate (common in-cluster auth)
-    if req.TLS != nil && len(req.TLS.PeerCertificates) > 0 {
-        cert := req.TLS.PeerCertificates[0]
-        // Parse from cert subject: system:serviceaccount:<namespace>:<name>
-        for _, name := range cert.Subject.Names {
-            if nameStr, ok := name.Value.(string); ok {
-                if strings.HasPrefix(nameStr, "system:serviceaccount:") {
-                    parts := strings.Split(nameStr, ":")
-                    if len(parts) == 4 {
-                        return parts[2], parts[3], nil
-                    }
-                }
-            }
-        }
+func NewTokenCache() *TokenCache {
+    return &TokenCache{
+        tokens: make(map[string]*CachedToken),
     }
-
-    // Check Authorization header for existing token (less common)
-    authHeader := req.Header.Get("Authorization")
-    if strings.HasPrefix(authHeader, "Bearer ") {
-        // Could validate token to extract SA info, but complex
-        // For now, rely on certificate authentication
-    }
-
-    return "", "", fmt.Errorf("no ServiceAccount found in request")
 }
 
 func (c *TokenCache) Get(key string) string {
@@ -947,12 +949,13 @@ status:
    - Test cleanup when ServiceAccountMapping deleted
    - Test handling of binding changes (clusters added/removed)
 
-2. **cluster-proxy Token Resolver Tests**
-   - Test token resolution for valid ServiceAccountMapping
+2. **proxy-agent SAMappingWatcher Tests**
+   - Test watching ServiceAccountMapping resources on hub
+   - Test mapping cache updates
+   - Test token resolution for valid mappings
+   - Test local token generation
    - Test cache hit/miss scenarios
-   - Test token refresh before expiration
    - Test error handling when mapping not found
-   - Test error handling when cluster unreachable
 
 ### Integration Tests
 

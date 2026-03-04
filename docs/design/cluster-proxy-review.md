@@ -21,17 +21,18 @@ cluster-proxy is built on [apiserver-network-proxy (konnectivity)](https://githu
 
 ```
 Application (ArgoCD)
-    ↓ HTTP request
+    ↓ HTTP request with hub SA auth
 user-server (HTTP proxy on hub)
     ↓ creates gRPC tunnel
 ANP proxy-server (hub)
-    ↓ gRPC tunnel
+    ↓ gRPC tunnel (hub SA auth passed through)
 proxy-agent (spoke)
-    ↓ forwards to
+    ↓ [ServiceAccountMapping: hub SA → spoke token injection]
+    ↓ forwards with spoke token
 Managed Cluster API Server
 ```
 
-### Key Discovery: user-server is an HTTP Proxy
+### Key Discovery: cluster-proxy is HTTP-Aware
 
 Initial confusion: The konnectivity example shows TCP-level tunneling:
 ```go
@@ -40,14 +41,25 @@ cfg.Dial = tunnel.DialContext  // Override TCP dialer
 
 This suggested cluster-proxy only handles TCP tunneling.
 
-**However**, cluster-proxy also has a **user-server component** that:
-- ✅ Is an HTTP reverse proxy (uses `httputil.ReverseProxy`)
-- ✅ Receives HTTP requests from applications
-- ✅ Can see and modify HTTP headers (including Authorization)
-- ✅ Already creates tunnels to managed clusters
-- ✅ Perfect for ServiceAccountMapping implementation
+**However**, cluster-proxy has HTTP-aware components that can intercept and modify requests:
 
-### user-server Code Evidence
+**Hub-side:**
+
+- **user-server**: HTTP reverse proxy (uses `httputil.ReverseProxy`)
+- Receives HTTP requests from applications
+- Can see and modify HTTP headers (including Authorization)
+- Already creates tunnels to managed clusters
+
+**Spoke-side:**
+
+- **proxy-agent**: Receives requests from gRPC tunnel
+- Can intercept HTTP requests before forwarding to local API server
+- Can modify headers (including Authorization)
+- **✅ Chosen location for ServiceAccountMapping implementation** (better performance/scalability)
+
+### Architecture Deep Dive
+
+#### user-server (Hub-side HTTP Proxy)
 
 From `/pkg/userserver/user_server.go`:
 
@@ -74,58 +86,81 @@ func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 ## Implementation Decision
 
-### ✅ Implement in cluster-proxy user-server
+### ✅ Implement in cluster-proxy proxy-agent (spoke-side)
 
-The user-server component is the perfect location for ServiceAccountMapping logic because:
+The proxy-agent component (on managed clusters) is chosen for ServiceAccountMapping logic because:
 
-1. **HTTP-aware**: It's an HTTP proxy that can see and modify headers
-2. **Extracts cluster**: Already parses target cluster from URL
-3. **Receives auth**: Can extract caller ServiceAccount from request authentication
-4. **Has connectivity**: Already creates tunnels to managed clusters
-5. **Strategic location**: All HTTP requests to managed clusters flow through it
+1. **Hub access**: proxy-agent already has hub kubeconfig for OCM operations
+2. **Can watch hub**: Can watch ServiceAccountMapping CRs on hub
+3. **Local token generation**: Generates tokens locally on spoke (lower latency)
+4. **Distributed caching**: Each spoke caches its own tokens (better scalability)
+5. **Less hub load**: No token requests from hub to spoke
+6. **Simpler hub**: Hub user-server remains unchanged
 
 ### Enhancement Approach
 
-Add ServiceAccountMapping logic to `user-server.ServeHTTP()`:
+Add ServiceAccountMapping logic to **proxy-agent** (spoke-side):
 
 ```go
-func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
-    // Extract target cluster (existing code)
-    tsc, _ := utils.GetTargetServiceConfig(req.RequestURI)
+// In proxy-agent on managed cluster
+type ProxyAgent struct {
+    saMappingWatcher *SAMappingWatcher
+    hubClient        client.Client  // Already exists for OCM operations
+    spokeClient      kubernetes.Interface
+    clusterName      string
+}
 
-    // NEW: Extract caller ServiceAccount from authentication
-    callerNamespace, callerSA, _ := extractServiceAccountFromAuth(req)
+func (a *ProxyAgent) Start(ctx context.Context) error {
+    // Initialize SAMappingWatcher with hub client
+    a.saMappingWatcher = NewSAMappingWatcher(
+        a.hubClient,      // Uses existing hub kubeconfig
+        a.spokeClient,    // Local kube client
+        a.clusterName,
+    )
 
-    // NEW: Look up ServiceAccountMapping and get token
-    if token, err := k.tokenResolver.ResolveToken(req.Context(),
-        callerNamespace, callerSA, tsc.Cluster); err == nil {
-        // NEW: Inject spoke token
-        req.Header.Set("Authorization", "Bearer "+token)
+    // Start watching ServiceAccountMapping on hub
+    if err := a.saMappingWatcher.Start(ctx); err != nil {
+        return err
     }
 
-    // Continue with existing proxy logic
-    tunnel, _ := k.getTunnel(req.Context())
-    proxy.ServeHTTP(wr, req)
+    // Continue with existing proxy-agent logic
+    // ...
+}
+
+// When processing requests from tunnel
+func (a *ProxyAgent) HandleRequest(req *http.Request) error {
+    // Extract hub SA from request authentication
+    hubNamespace, hubSA, err := extractHubSAFromRequest(req)
+    if err == nil && hubSA != "" {
+        // Try to resolve spoke token via local cache + local TokenRequest
+        if token, err := a.saMappingWatcher.ResolveToken(req.Context(), hubNamespace, hubSA); err == nil {
+            // Inject spoke token
+            req.Header.Set("Authorization", "Bearer "+token)
+        }
+    }
+
+    // Forward to local API server
+    // ...
 }
 ```
 
 ## Why Not Other Options?
 
-### ❌ OCM Registration Proxy Subresource Handler
+### ❌ Hub-side (user-server) Implementation
 
-Initially considered implementing in OCM registration (if it has a proxy handler).
-
-**Problem**: Adds another layer of indirection. user-server already exists and serves this exact purpose.
-
-### ❌ Spoke-side Implementation
-
-Could enhance proxy-agent on spoke clusters to handle token mapping.
+Initially considered implementing in user-server on hub.
 
 **Problems**:
-- Need to sync ServiceAccountMapping info to all spokes
-- Distributed token caching (less efficient)
-- More complex implementation
-- Higher latency (extra hops)
+- Hub must call spoke TokenRequest API (extra network hop)
+- Centralized token caching (hub becomes bottleneck)
+- More hub load as it handles all token requests
+- Requires user-server changes
+
+### ❌ OCM Registration Proxy Subresource Handler
+
+Could implement in OCM registration (if it has a proxy handler).
+
+**Problem**: Adds another layer of indirection when cluster-proxy already exists.
 
 ### ❌ Client Library Wrapper
 
@@ -138,47 +173,52 @@ Provide a library that wraps Kubernetes client and handles token acquisition.
 
 ## Comparison Table
 
-| Aspect | user-server Enhancement | OCM Registration Handler | Client Library |
-|--------|------------------------|--------------------------|----------------|
-| **Code Changes for Apps** | Zero | Zero | Minor (use wrapper) |
-| **HTTP-aware** | Yes (already) | Maybe (depends) | Yes |
-| **Implementation Complexity** | Low (add to existing) | Medium (new handler?) | Low |
-| **Token Caching** | Centralized | Centralized | Per-process |
-| **cluster-proxy Changes** | Minimal | None | None |
-| **Architecture Impact** | Minimal | Depends | None |
+| Aspect | proxy-agent Enhancement (Spoke-side) | user-server Enhancement (Hub-side) | OCM Registration Handler | Client Library |
+|--------|-------------------------------------|-----------------------------------|--------------------------|----------------|
+| **Code Changes for Apps** | Zero | Zero | Zero | Minor (use wrapper) |
+| **Token Generation** | Local (spoke) | Remote (hub to spoke API) | Depends | Local |
+| **Token Caching** | Distributed | Centralized | Centralized | Per-process |
+| **Network Latency** | Low (local) | High (extra hop) | Medium | Low |
+| **Hub Load** | Low | High | Medium | None |
+| **Scalability** | High | Low | Medium | High |
+| **Implementation Complexity** | Low | Low | Medium | Low |
+| **cluster-proxy Changes** | Minimal (proxy-agent) | Minimal (user-server) | None | None |
 
 ## Conclusion
 
-**Implement ServiceAccountMapping in cluster-proxy user-server.**
+**Implement ServiceAccountMapping in cluster-proxy proxy-agent (spoke-side).**
 
-The user-server component is:
-- Already an HTTP proxy
-- Already receives all application requests to managed clusters
-- Perfect strategic location for transparent token injection
+The proxy-agent component is the optimal location because it:
 
-No need to create new components or modify OCM registration. Just enhance the existing user-server.ServeHTTP() method.
+- Already has hub kubeconfig for OCM operations (can watch hub resources)
+- Can generate tokens locally on spoke (lower latency)
+- Enables distributed token caching (better scalability)
+- Reduces hub load (no token requests from hub to spoke)
+- Keeps hub user-server unchanged (simpler architecture)
 
 ## Files to Modify
 
 In cluster-proxy repository (`open-cluster-management.io/cluster-proxy`):
 
-1. **`pkg/userserver/token_resolver.go`** (new file)
-   - ServiceAccountMapping lookup
-   - Token resolution via managed cluster TokenRequest API
+1. **`pkg/proxyagent/agent/sa_mapping_watcher.go`** (new file)
+   - Watch ServiceAccountMapping CRs on hub cluster
+   - Build and maintain local mapping cache
+   - Token resolution via local TokenRequest API
    - Token caching logic
 
-2. **`pkg/userserver/user_server.go`** (enhance existing)
-   - Add ServiceAccountMapping logic to `ServeHTTP()`
-   - Extract caller ServiceAccount from request
+2. **`pkg/proxyagent/agent/agent.go`** (enhance existing)
+   - Initialize SAMappingWatcher with hub client
+   - Extract hub ServiceAccount from incoming requests
    - Inject spoke token if mapping exists
+   - Forward request to local API server
 
-3. **`pkg/userserver/auth_extractor.go`** (new file)
+3. **`pkg/proxyagent/agent/auth_extractor.go`** (new file)
    - Extract ServiceAccount identity from request authentication
-   - Handle client certificate and token authentication
+   - Handle client certificate and token authentication from hub
 
 ## Next Steps
 
-1. Implement ServiceAccountMapping controller in managed-serviceaccount repo
-2. Enhance cluster-proxy user-server with token resolution logic
-3. Add token caching to user-server
+1. Implement ServiceAccountMapping CRD and controller in managed-serviceaccount repo
+2. Enhance cluster-proxy proxy-agent with ServiceAccountMapping watcher
+3. Add token caching to proxy-agent
 4. Test with ArgoCD and other hub applications
